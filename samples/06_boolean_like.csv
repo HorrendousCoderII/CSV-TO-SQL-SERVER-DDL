@@ -1,0 +1,4 @@
+setting_key,is_enabled,flag_yes_no
+dark_mode,true,yes
+notifications,false,no
+beta_features,true,yes

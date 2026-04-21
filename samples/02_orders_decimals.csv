@@ -1,0 +1,4 @@
+order_id,sku,qty,unit_price,discount_pct
+1001,A-1,2,19.99,0.05
+1002,B-2,1,125.50,0
+1003,A-1,5,19.99,0.10
