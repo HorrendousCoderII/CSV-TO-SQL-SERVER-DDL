@@ -470,6 +470,121 @@ def _sql_type_sqlite(col: ColumnInference) -> str:
     raise ValueError(k)
 
 
+TRUE_BOOL_TOKENS = frozenset({"true", "1", "yes", "y", "t"})
+FALSE_BOOL_TOKENS = frozenset({"false", "0", "no", "n", "f"})
+
+
+def resolve_table_base_name(table_name: str) -> str:
+    """Sanitized table name used in DDL/INSERT and for suggested download filenames."""
+    t = sanitize_base_name(table_name)
+    if not t or t == "column":
+        t = "imported_table"
+    return t
+
+
+def _quoted_table_name(table_name: str, dialect: Dialect) -> str:
+    return quote_identifier(resolve_table_base_name(table_name), dialect)
+
+
+def _sql_char_literal(text: str, dialect: Dialect) -> str:
+    esc = text.replace("'", "''")
+    if dialect == "sqlserver":
+        return f"N'{esc}'"
+    return f"'{esc}'"
+
+
+def _is_null_cell(raw: object) -> bool:
+    if raw is None:
+        return True
+    if isinstance(raw, str) and not raw.strip():
+        return True
+    return False
+
+
+def _format_insert_value(raw: object, col: ColumnInference, dialect: Dialect) -> str:
+    if _is_null_cell(raw):
+        return "NULL"
+    s = str(raw).strip()
+
+    k = col.kind
+    if k == InferredKind.BOOLEAN:
+        v = s.lower()
+        if v in TRUE_BOOL_TOKENS:
+            if dialect == "postgresql":
+                return "TRUE"
+            return "1"
+        if v in FALSE_BOOL_TOKENS:
+            if dialect == "postgresql":
+                return "FALSE"
+            return "0"
+        return "NULL"
+
+    if k in (InferredKind.INTEGER, InferredKind.BIGINT):
+        try:
+            return str(int(s, 10))
+        except ValueError:
+            return "NULL"
+
+    if k == InferredKind.NUMERIC:
+        try:
+            d = Decimal(s)
+            return format(d, "f")
+        except (InvalidOperation, ValueError):
+            return "NULL"
+
+    if k == InferredKind.DATE:
+        dt = _try_parse_datetime(s)
+        if dt is None:
+            return "NULL"
+        return _sql_char_literal(dt.date().isoformat(), dialect)
+
+    if k == InferredKind.TIMESTAMP:
+        dt = _try_parse_datetime(s)
+        if dt is None:
+            return "NULL"
+        if dt.microsecond:
+            inner = dt.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
+        else:
+            inner = dt.strftime("%Y-%m-%d %H:%M:%S")
+        return _sql_char_literal(inner, dialect)
+
+    if k == InferredKind.VARCHAR:
+        return _sql_char_literal(s, dialect)
+
+    raise ValueError(k)
+
+
+def render_insert_statements(
+    df: pl.DataFrame,
+    columns: list[ColumnInference],
+    dialect: Dialect,
+    *,
+    table_name: str,
+    max_rows: int | None = None,
+) -> str:
+    """
+    Emit one INSERT per row. ``columns`` must match ``infer_dataframe_schema(df)`` pairing
+    (``original_name`` ↔ dataframe column).
+    """
+    table_sql = _quoted_table_name(table_name, dialect)
+    work = df if max_rows is None else df.head(max_rows)
+
+    col_idents = [quote_identifier(c.sql_name, dialect) for c in columns]
+    cols_sql = ", ".join(col_idents)
+
+    lines: list[str] = []
+    for row_idx in range(work.height):
+        parts: list[str] = []
+        for col in columns:
+            series = work[col.original_name]
+            raw = series[row_idx]
+            parts.append(_format_insert_value(raw, col, dialect))
+        vals_sql = ", ".join(parts)
+        lines.append(f"INSERT INTO {table_sql} ({cols_sql}) VALUES ({vals_sql});")
+
+    return "\n".join(lines)
+
+
 def render_create_table(
     table_name: str,
     columns: list[ColumnInference],
@@ -483,10 +598,7 @@ def render_create_table(
       - safe: all columns allow NULL (safest for ad-hoc imports).
       - strict: NOT NULL on columns with no empty values; NULL allowed otherwise.
     """
-    t = sanitize_base_name(table_name)
-    if not t or t == "column":
-        t = "imported_table"
-    table_sql = quote_identifier(t, dialect)
+    table_sql = _quoted_table_name(table_name, dialect)
 
     lines: list[str] = []
     if if_not_exists:
