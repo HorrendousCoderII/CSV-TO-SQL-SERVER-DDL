@@ -11,6 +11,7 @@ from schema_infer import (
     infer_dataframe_schema,
     load_csv,
     render_create_table,
+    render_insert_statements,
     sanitize_column_names,
     unique_sql_names,
 )
@@ -143,3 +144,54 @@ def test_sqlserver_if_not_exists():
     cols = infer_dataframe_schema(df)
     sql = render_create_table("t", cols, "sqlserver", if_not_exists=True)
     assert "IF NOT EXISTS" in sql
+
+
+def test_insert_postgresql_basic():
+    csv = b"id,name\n1,Ann\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    ins = render_insert_statements(df, cols, "postgresql", table_name="people")
+    assert "INSERT INTO" in ins
+    assert "VALUES (1, 'Ann')" in ins
+
+
+def test_insert_sqlite_basic():
+    csv = b"a,b\n3,hello\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    ins = render_insert_statements(df, cols, "sqlite", table_name="t")
+    assert "INSERT INTO" in ins
+    assert "VALUES (3, 'hello')" in ins
+
+
+def test_insert_sqlserver_reserved_column_quoted():
+    csv = b"order\n1\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    ins = render_insert_statements(df, cols, "sqlserver", table_name="t")
+    assert "[order]" in ins
+    assert "VALUES (1)" in ins
+
+
+def test_insert_apostrophe_escaped_sqlserver():
+    csv = b"nm\nO'Brien\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    ins = render_insert_statements(df, cols, "sqlserver", table_name="t")
+    assert "N'O''Brien'" in ins
+
+
+def test_insert_max_rows():
+    csv = b"x\n1\n2\n3\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    ins = render_insert_statements(df, cols, "postgresql", table_name="t", max_rows=2)
+    assert ins.count("INSERT INTO") == 2
+
+
+def test_insert_null_empty_cell():
+    csv = b"a,b\n1,\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    ins = render_insert_statements(df, cols, "postgresql", table_name="t")
+    assert "VALUES (1, NULL)" in ins
