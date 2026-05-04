@@ -4,12 +4,14 @@ from __future__ import annotations
 import io
 
 import polars as pl
+import pytest
 
 from schema_infer import (
     InferredKind,
     infer_column,
     infer_dataframe_schema,
     load_csv,
+    render_create_indexes,
     render_create_table,
     render_insert_statements,
     sanitize_column_names,
@@ -22,6 +24,24 @@ def test_load_csv_casts_all_utf8():
     df = load_csv(io.BytesIO(csv))
     assert df.dtypes == [pl.Utf8, pl.Utf8]
     assert df.height == 2
+
+
+def test_load_csv_tab_separator():
+    csv = b"a\tb\n1\tx\n"
+    df = load_csv(io.BytesIO(csv), separator="\t")
+    assert list(df.columns) == ["a", "b"]
+    assert df.height == 1
+
+
+def test_load_csv_semicolon_separator():
+    csv = b"a;b\n1;2\n"
+    df = load_csv(io.BytesIO(csv), separator=";")
+    assert list(df.columns) == ["a", "b"]
+
+
+def test_load_csv_invalid_separator_length():
+    with pytest.raises(ValueError, match="exactly one character"):
+        load_csv(io.BytesIO(b"a\n1\n"), separator=",,")
 
 
 def test_infer_integer_column():
@@ -93,6 +113,88 @@ def test_if_not_exists():
     cols = infer_dataframe_schema(df)
     sql = render_create_table("t", cols, "postgresql", if_not_exists=True)
     assert "IF NOT EXISTS" in sql
+
+
+def test_primary_key_constraint_and_not_null_in_safe_mode():
+    csv = b"id,val\n1,a\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    sql = render_create_table(
+        "t",
+        cols,
+        "postgresql",
+        nullable_mode="safe",
+        primary_key=["id"],
+    )
+    assert "PRIMARY KEY" in sql
+    assert "NOT NULL" in sql
+
+
+def test_primary_key_unknown_column_raises():
+    csv = b"a\n1\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    with pytest.raises(ValueError, match="unknown primary key"):
+        render_create_table("t", cols, "postgresql", primary_key=["nope"])
+
+
+def test_render_create_indexes_postgresql_if_not_exists():
+    csv = b"id,name\n1,Ann\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    sql = render_create_indexes(
+        "people",
+        cols,
+        "postgresql",
+        [["name"]],
+        if_not_exists=True,
+    )
+    assert "CREATE INDEX IF NOT EXISTS" in sql
+    assert "ON" in sql
+
+
+def test_render_create_indexes_sqlite_if_not_exists():
+    csv = b"id,name\n1,Ann\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    sql = render_create_indexes(
+        "people",
+        cols,
+        "sqlite",
+        [["name"]],
+        if_not_exists=True,
+    )
+    assert "CREATE INDEX IF NOT EXISTS" in sql
+
+
+def test_render_create_indexes_sqlserver_no_if_not_exists():
+    csv = b"id,name\n1,Ann\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    sql = render_create_indexes(
+        "people",
+        cols,
+        "sqlserver",
+        [["name"]],
+        if_not_exists=True,
+    )
+    assert "IF NOT EXISTS" not in sql
+    assert "CREATE INDEX" in sql
+    assert "[name]" in sql or "name" in sql
+
+
+def test_render_create_indexes_skips_redundant_primary_key():
+    csv = b"id\n1\n"
+    df = load_csv(io.BytesIO(csv))
+    cols = infer_dataframe_schema(df)
+    sql = render_create_indexes(
+        "t",
+        cols,
+        "postgresql",
+        [["id"]],
+        primary_key=["id"],
+    )
+    assert sql == ""
 
 
 def test_sqlite_uses_text_for_strings():

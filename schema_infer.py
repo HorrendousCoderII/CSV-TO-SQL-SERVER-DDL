@@ -114,15 +114,24 @@ MSSQL_NVARCHAR_INLINE_MAX = 4000
 MSSQL_DECIMAL_MAX_PRECISION = 38
 
 
-def load_csv(source: Union[str, bytes, BinaryIO]) -> pl.DataFrame:
+def load_csv(
+    source: Union[str, bytes, BinaryIO],
+    *,
+    separator: str = ",",
+) -> pl.DataFrame:
     """
     Load CSV with a full scan, then cast every column to Utf8 so mixed-type columns
     are preserved as their textual representation for inference.
+
+    ``separator`` must be exactly one character (e.g. ``,``, ``;``, ``\\t``, ``|``).
     """
+    if len(separator) != 1:
+        raise ValueError("separator must be exactly one character")
     if isinstance(source, bytes):
         source = io.BytesIO(source)
     df = pl.read_csv(
         source,
+        separator=separator,
         try_parse_dates=False,
         infer_schema_length=None,
     )
@@ -592,12 +601,29 @@ def render_create_table(
     *,
     if_not_exists: bool = False,
     nullable_mode: Literal["safe", "strict"] = "safe",
+    primary_key: list[str] | None = None,
 ) -> str:
     """
     nullable_mode:
       - safe: all columns allow NULL (safest for ad-hoc imports).
       - strict: NOT NULL on columns with no empty values; NULL allowed otherwise.
+
+    primary_key: optional list of ``sql_name`` values. Those columns are always ``NOT NULL``
+    (required for a valid PRIMARY KEY). Table-level ``PRIMARY KEY (...)`` is appended.
     """
+    sql_names = {c.sql_name for c in columns}
+    pk_tuple: tuple[str, ...] = ()
+    if primary_key is not None:
+        if not primary_key:
+            raise ValueError("primary_key must not be empty when provided")
+        if len(primary_key) != len(set(primary_key)):
+            raise ValueError("duplicate column in primary_key")
+        for name in primary_key:
+            if name not in sql_names:
+                raise ValueError(f"unknown primary key column: {name!r}")
+        pk_tuple = tuple(primary_key)
+
+    pk_set = set(pk_tuple)
     table_sql = _quoted_table_name(table_name, dialect)
 
     lines: list[str] = []
@@ -616,12 +642,84 @@ def render_create_table(
         else:
             typ = _sql_type_sqlite(col)
 
-        if nullable_mode == "safe":
+        if col.sql_name in pk_set:
+            null_sql = "NOT NULL"
+        elif nullable_mode == "safe":
             null_sql = "NULL"
         else:
             null_sql = "NULL" if col.nullable else "NOT NULL"
         parts.append(f"    {ident} {typ} {null_sql}")
 
+    if pk_tuple:
+        pk_list = ", ".join(quote_identifier(n, dialect) for n in pk_tuple)
+        parts.append(f"    PRIMARY KEY ({pk_list})")
+
     lines.append(",\n".join(parts))
     lines.append(");")
     return "\n".join(lines)
+
+
+def render_create_indexes(
+    table_name: str,
+    columns: list[ColumnInference],
+    dialect: Dialect,
+    index_specs: list[list[str]],
+    *,
+    if_not_exists: bool = True,
+    primary_key: list[str] | None = None,
+) -> str:
+    """
+    Emit ``CREATE INDEX`` statements after ``CREATE TABLE``. Each inner list of
+    ``index_specs`` is a composite index over ``sql_name`` column names (order matters).
+
+    For PostgreSQL and SQLite, ``IF NOT EXISTS`` is included when ``if_not_exists`` is True.
+    SQL Server does not use ``IF NOT EXISTS`` on ``CREATE INDEX`` in this generator.
+
+    If ``primary_key`` is set, an index whose column list matches the primary key
+    (same order) is omitted as redundant.
+    """
+    if not index_specs:
+        return ""
+
+    sql_names = {c.sql_name for c in columns}
+    pk_order = tuple(primary_key) if primary_key else None
+
+    statements: list[str] = []
+    used_names: set[str] = set()
+
+    for spec in index_specs:
+        if not spec:
+            raise ValueError("each index must include at least one column")
+        if len(spec) != len(set(spec)):
+            raise ValueError("duplicate column in index specification")
+        for name in spec:
+            if name not in sql_names:
+                raise ValueError(f"unknown index column: {name!r}")
+        if pk_order is not None and tuple(spec) == pk_order:
+            continue
+
+        base_raw = "idx_" + resolve_table_base_name(table_name) + "_" + "_".join(spec)
+        base_name = sanitize_base_name(base_raw)
+        if len(base_name) > 110:
+            base_name = sanitize_base_name(base_name[:110])
+        idx_name = base_name
+        n = 2
+        while idx_name in used_names:
+            idx_name = f"{base_name}_{n}"
+            n += 1
+        used_names.add(idx_name)
+
+        idx_ident = quote_identifier(idx_name, dialect)
+        table_sql = _quoted_table_name(table_name, dialect)
+        col_list = ", ".join(quote_identifier(cn, dialect) for cn in spec)
+
+        if dialect == "sqlserver":
+            statements.append(f"CREATE INDEX {idx_ident} ON {table_sql} ({col_list});")
+        elif if_not_exists:
+            statements.append(
+                f"CREATE INDEX IF NOT EXISTS {idx_ident} ON {table_sql} ({col_list});"
+            )
+        else:
+            statements.append(f"CREATE INDEX {idx_ident} ON {table_sql} ({col_list});")
+
+    return "\n".join(statements)

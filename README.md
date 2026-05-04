@@ -26,19 +26,21 @@ flowchart LR
   subgraph ui [Streamlit app]
     A[Upload CSV] --> B[User options]
     B --> C[Preview table]
-    C --> D[Generated CREATE TABLE SQL]
+    C --> D[Generated SQL]
   end
   subgraph core [schema_infer.py]
     E[load_csv] --> F[infer_dataframe_schema]
     F --> G[render_create_table]
+    G --> H[render_create_indexes]
   end
   A --> E
-  G --> D
+  H --> D
 ```
 
-1. **`load_csv`** reads the file with [Polars](https://pola.rs/), scans the full file, and casts **every column to UTF-8 strings**. That way mixed-type columns (e.g. numbers and `N/A`) stay as text and are classified as character data instead of being coerced to numbers and failing inference.
+1. **`load_csv`** reads the file with [Polars](https://pola.rs/) (`separator` is configurable; default comma), scans the full file, and casts **every column to UTF-8 strings**. That way mixed-type columns (e.g. numbers and `N/A`) stay as text and are classified as character data instead of being coerced to numbers and failing inference.
 2. **`infer_dataframe_schema`** walks each column, derives a **`ColumnInference`** (logical kind, nullability, string length or numeric precision, etc.), and builds safe SQL identifiers from header names (sanitize, deduplicate, quote reserved words per dialect).
-3. **`render_create_table`** maps each inferred kind to a concrete SQL type for the selected dialect and emits the `CREATE TABLE` statement.
+3. **`render_create_table`** maps each inferred kind to a concrete SQL type for the selected dialect and emits the `CREATE TABLE` statement. Optional **`PRIMARY KEY`** adds a table constraint and forces **`NOT NULL`** on those columns (even when nullability is **safe** — see below).
+4. **`render_create_indexes`** emits separate **`CREATE INDEX`** statements (composite indexes supported). PostgreSQL and SQLite use **`CREATE INDEX IF NOT EXISTS`** when requested; SQL Server omits `IF NOT EXISTS` on indexes in this generator. An index that duplicates the primary key column list (same order) is skipped.
 
 Nothing is written to a database; you only get text to run manually (or paste into migrations).
 
@@ -49,13 +51,17 @@ Nothing is written to a database; you only get text to run manually (or paste in
 | Control | Purpose |
 |--------|---------|
 | **Upload** | CSV file; required for generation. |
+| **Delimiter** | Field separator for parsing: comma, semicolon, tab, pipe, or a single custom character (passed to Polars `read_csv`). Changing file or delimiter resets index definitions. |
 | **SQL dialect** | `postgresql`, `sqlite`, or `sqlserver` — changes types and identifier quoting (`"…"`, `[…]`, etc.). |
 | **Table name** | Logical name for the table. Defaults from the uploaded filename. It is sanitized (safe characters, lowercase base name) before use in SQL. |
 | **Preview rows** | How many rows of the parsed frame to show (1–500); does not affect inference (the whole file is still read). |
-| **Nullability** | **Safe** — every column is nullable in DDL (good for messy imports). **Strict** — `NOT NULL` only where every non-empty row has a value in that column. |
+| **Nullability** | **Safe** — every column is nullable in DDL except **primary key** columns, which are always `NOT NULL`. **Strict** — `NOT NULL` only where every non-empty row has a value in that column (primary key columns remain `NOT NULL` as required). |
 | **CREATE TABLE IF NOT EXISTS** | Adds `IF NOT EXISTS` where the dialect supports it. On SQL Server, that form needs **SQL Server 2016+**. |
+| **Define PRIMARY KEY** | Optional. Choose one or more header columns (order preserved for composite keys). Headers map to inferred SQL column names. |
+| **Indexes** | Add one or more indexes; each index is a multiselect of columns (order preserved). Names are generated deterministically. Redundant indexes that match the primary key are omitted. |
+| **Generate INSERT statements** | Optional data load SQL after the schema statements. |
 
-After upload, the app shows a **data preview** and the **generated SQL** in a code block.
+After upload, the app shows a **data preview** and **generated SQL** (`CREATE TABLE`, optional `CREATE INDEX`, optional `INSERT`) in code blocks. **Copy DDL** / **Download DDL** include `CREATE TABLE` plus any `CREATE INDEX` lines. **Download schema + INSERTs** appends `INSERT` statements when that option is enabled.
 
 ---
 
@@ -96,9 +102,10 @@ Always review generated DDL against your real requirements (indexes, constraints
 
 Main entry points:
 
-- `load_csv(source)` → `pl.DataFrame` (all string columns).
+- `load_csv(source, separator=",")` → `pl.DataFrame` (all string columns). `separator` must be exactly one character.
 - `infer_dataframe_schema(df)` → `list[ColumnInference]`.
-- `render_create_table(table_name, columns, dialect, …)` → `str` (DDL).
+- `render_create_table(table_name, columns, dialect, …, primary_key=None)` → `str` (DDL). `primary_key` lists **`sql_name`** strings from inference.
+- `render_create_indexes(table_name, columns, dialect, index_specs, …)` → `str` (zero or more `CREATE INDEX` statements). Each inner list of `index_specs` is ordered **`sql_name`** columns for one index.
 
 Helpers such as `infer_column`, `sanitize_column_names`, and `quote_identifier` are available for finer-grained use; see docstrings in [`schema_infer.py`](schema_infer.py).
 
@@ -128,8 +135,8 @@ pytest tests/test_infer.py -v
 
 - **Whole file in memory:** The CSV is loaded fully for inference. Very large files can be slow or exhaust RAM; see sizing notes in [`samples/README.md`](samples/README.md).
 - **Inference is heuristic:** Strange outliers, locale-specific numbers, or inconsistent date formats may produce wider types (`VARCHAR`) or types you might hand-tune afterward.
-- **No `INSERT` statements:** This project generates **table DDL only** (unless you extend it).
-- **Clipboard / browser:** If you add client-side copy buttons later, some browsers only expose the clipboard on **HTTPS** or **localhost**.
+- **Indexes on SQL Server:** Generated `CREATE INDEX` does not use `IF NOT EXISTS`; make indexes idempotent in your migration tool if needed.
+- **Clipboard / browser:** Client-side copy buttons may only work on **HTTPS** or **localhost**.
 
 ---
 
